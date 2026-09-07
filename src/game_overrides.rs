@@ -4,14 +4,14 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const EMBEDDED: &str = include_str!("../assets/game_overrides.json");
 
-const UE_TAA_OFF_BLOCK: &str = "\
-; DLSS5oneclick — reduce double temporal with Feeder Present path\n\
-r.AntiAliasingMethod=0\n\
-r.PostProcessAAQuality=0\n";
+/// Printed Install tip when `taa_off` is set — we do **not** edit the game's Engine.ini.
+const UE_TAA_OFF_TIP: &str = "\
+Unreal tip: turn TAA / TSR off in the game's graphics options (or set r.AntiAliasingMethod=0 \
+yourself) so Feeder is not stacking on the engine's temporal AA. This tool does not edit Engine.ini.";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GameOverride {
@@ -33,7 +33,7 @@ pub struct GameOverride {
     pub light_stab_max_delta: Option<f32>,
     pub work_resolution: Option<i32>,
     pub auto_profile_applied: Option<i32>,
-    /// Write Unreal Engine.ini TAA-off hint under Saved/Config when possible.
+    /// If true, Install logs a printed instruction to disable TAA (never writes Engine.ini).
     pub taa_off: Option<bool>,
     /// Shown on Setup after Install (and when caps list Unreal-likely).
     pub setup_tip: Option<String>,
@@ -141,89 +141,6 @@ pub fn apply_to_cfg_text(cfg: &str, o: &GameOverride) -> String {
     out
 }
 
-/// Walk up from Shipping exe looking for `Saved` or project root with Binaries.
-fn unreal_project_root(exe: &Path) -> Option<PathBuf> {
-    let mut cur = exe.parent()?;
-    for _ in 0..8 {
-        let saved = cur.join("Saved");
-        if saved.is_dir() {
-            return Some(cur.to_path_buf());
-        }
-        // …/Game/Binaries/Win64 → project is parent of Binaries' parent
-        if cur
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|n| n.eq_ignore_ascii_case("Win64") || n.eq_ignore_ascii_case("WinGDK"))
-        {
-            if let Some(binaries) = cur.parent() {
-                if binaries
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|n| n.eq_ignore_ascii_case("Binaries"))
-                {
-                    if let Some(project) = binaries.parent() {
-                        if project.join("Saved").exists() || project.join("Content").exists() {
-                            return Some(project.to_path_buf());
-                        }
-                    }
-                }
-            }
-        }
-        cur = cur.parent()?;
-    }
-    None
-}
-
-/// Merge TAA-off cvars into Saved/Config Engine.ini (WindowsNoEditor + Windows).
-pub fn apply_ue_taa_off(exe: &Path) -> Result<Option<String>> {
-    let Some(root) = unreal_project_root(exe) else {
-        return Ok(None);
-    };
-    let mut written = Vec::new();
-    for sub in [
-        "Saved/Config/WindowsNoEditor/Engine.ini",
-        "Saved/Config/Windows/Engine.ini",
-    ] {
-        let path = root.join(sub);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let prev = if path.is_file() {
-            fs::read_to_string(&path).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if prev.contains("r.AntiAliasingMethod=0") {
-            continue;
-        }
-        let mut next = prev;
-        if !next.is_empty() && !next.ends_with('\n') {
-            next.push('\n');
-        }
-        if !next.contains("[SystemSettings]") {
-            next.push_str("\n[SystemSettings]\n");
-        }
-        if let Some(idx) = next.find("[SystemSettings]") {
-            let insert_at = idx + "[SystemSettings]".len();
-            next.insert_str(insert_at, &format!("\n{UE_TAA_OFF_BLOCK}"));
-        } else {
-            next.push_str(&format!("[SystemSettings]\n{UE_TAA_OFF_BLOCK}"));
-        }
-        fs::write(&path, next).with_context(|| format!("writing {}", path.display()))?;
-        written.push(path.display().to_string());
-    }
-    if written.is_empty() {
-        Ok(Some(
-            "Engine.ini already has r.AntiAliasingMethod=0 (TAA-off)".into(),
-        ))
-    } else {
-        Ok(Some(format!(
-            "Wrote Unreal TAA-off hint → {}",
-            written.join(", ")
-        )))
-    }
-}
-
 /// After Feeder cfg is written, apply a matching override (if any). Returns a log line.
 pub fn apply_for_game(game_dir: &Path, exe: &Path) -> Result<Option<String>> {
     let Some(o) = find_override(exe) else {
@@ -243,9 +160,12 @@ pub fn apply_for_game(game_dir: &Path, exe: &Path) -> Result<Option<String>> {
     } else {
         parts.push(format!("game override: {}", o.note));
     }
+    // Printed instruction only — never touch the game's Engine.ini (maintainer review #61).
     if o.taa_off == Some(true) {
-        if let Some(msg) = apply_ue_taa_off(exe)? {
-            parts.push(msg);
+        if let Some(tip) = o.setup_tip.as_ref().filter(|t| !t.is_empty()) {
+            parts.push(tip.clone());
+        } else {
+            parts.push(UE_TAA_OFF_TIP.to_owned());
         }
     }
     Ok(Some(parts.join(" · ")))
@@ -304,13 +224,16 @@ mod tests {
     }
 
     #[test]
-    fn ghostrunner_taa_off_seed() {
+    fn ghostrunner_taa_off_is_instruction_only() {
         let exe = PathBuf::from(
             r"D:\Games\Ghostrunner\Ghostrunner\Binaries\Win64\Ghostrunner-Win64-Shipping.exe",
         );
         let o = find_override(&exe).expect("ghostrunner");
         assert_eq!(o.taa_off, Some(true));
         assert_eq!(o.early_color, Some(false));
+        let tip = o.setup_tip.expect("setup_tip");
+        assert!(tip.contains("does not edit Engine.ini"));
+        assert!(!tip.to_ascii_lowercase().contains("writes"));
     }
 
     #[test]
