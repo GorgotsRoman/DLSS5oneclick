@@ -210,6 +210,13 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
              in the add-on panel.",
         ));
     } else if st.mode == game::Mode::Native {
+        if st.feeder {
+            out.push(warn(
+                "Mode is Native DLSS (game ships its own DLSS), but dlss5-feed.addon64 is still \
+                 present. Feeder Optimize does not apply here — NR is game/renodx. Run Remove \
+                 (incl. Feeder leftovers) or Install again so Native cleanup drops the Feeder.",
+            ));
+        }
         // The add-on hooks NVSDK_NGX_D3D12_*. A game whose DLSS runs on D3D11
         // calls the D3D11 entry points, which it never sees, so "no create"
         // is expected until the bridge is installed (#33, BG3 DX11).

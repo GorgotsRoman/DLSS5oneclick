@@ -115,32 +115,34 @@ pub enum Mode {
 /// Graphics API the exe imports, from its PE import table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Api {
+    /// Direct3D 9. DLSS 5 needs a D3D11/12 device; the supported path is
+    /// dgVoodoo2 translating D3D9 to D3D11 so this tool's `dxgi.dll` ReShade
+    /// can load (verified on Dead or Alive 5 Last Round, #17, #37). Install
+    /// downloads official dgVoodoo 2.87.3 into the game folder when missing.
+    /// Aion loads system d3d9.dll by name (#16) so local ReShade d3d9.dll hooks it.
+    Dx9,
     /// Direct3D 10/10.1. The 32-bit Feeder add-on runs these natively from
     /// 0.13.1-beta.1 (a private D3D11 relay device inside the game process);
     /// a game imports `d3d10_1.dll` rather than `d3d10.dll` in practice.
     Dx10,
     Dx11,
     Dx12,
-    /// Imports `d3d9.dll` and no newer Direct3D. DLSS needs a D3D11/12 device,
-    /// so these need dgVoodoo2 in front before anything here applies -- and the
-    /// system d3d9.dll is loaded by name, so a local ReShade d3d9.dll is what
-    /// hooks it, never the dxgi.dll this tool installs (#16, Aion).
-    Dx9,
     /// Imports `vulkan-1.dll` and no Direct3D. ReShade reaches a Vulkan game
     /// through a registered Vulkan layer, not through a `dxgi.dll` beside the
     /// exe, so this install has nothing to load (#6, Detroit: Become Human).
     Vulkan,
-    /// Neither d3d11.dll nor d3d12.dll is a static import (loaded at runtime, or DX9/Vulkan).
+    /// No static D3D/Vulkan import (loaded at runtime). Treated like DX12 for
+    /// the install plan; DX9 is classified separately when `d3d9.dll` is imported.
     Unknown,
 }
 
 impl Api {
     pub fn label(self) -> &'static str {
         match self {
+            Api::Dx9 => "DX9",
             Api::Dx10 => "DX10",
             Api::Dx11 => "DX11",
             Api::Dx12 => "DX12",
-            Api::Dx9 => "DX9",
             Api::Vulkan => "Vulkan",
             Api::Unknown => "API unknown, assuming DX12",
         }
@@ -332,8 +334,8 @@ pub fn pe_imports(exe: &Path) -> Vec<String> {
 }
 
 /// Which D3D a static import table implies. `d3d10_1.dll` is what a Direct3D
-/// 10 game actually imports; the upstream installer looked only for
-/// `d3d10.dll` and mistook such games for DirectX 9.
+/// 10 game actually imports (often alongside `d3d9.dll`); higher APIs win so
+/// those are not misclassified as DirectX 9.
 fn classify_imports(imports: &[String]) -> Api {
     let has = |n: &str| imports.iter().any(|i| i == n);
     if has("d3d12.dll") {
@@ -473,9 +475,30 @@ pub fn is_dgvoodoo(game_dir: &Path) -> bool {
     }
     let dll = game_dir.join("d3d9.dll");
     match fs::read(&dll) {
-        Ok(b) => b.windows(8).any(|w| w.eq_ignore_ascii_case(b"dgVoodoo")),
+        Ok(b) => dll_mentions_dgvoodoo(&b),
         Err(_) => false,
     }
+}
+
+/// Official dgVoodoo builds embed the product name as UTF-16LE in the PE
+/// resources; older / debug builds may use ASCII. Either counts.
+fn dll_mentions_dgvoodoo(b: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"dgVoodoo";
+    if b.windows(NEEDLE.len())
+        .any(|w| w.eq_ignore_ascii_case(NEEDLE))
+    {
+        return true;
+    }
+    let n = NEEDLE.len() * 2;
+    if b.len() < n {
+        return false;
+    }
+    b.windows(n).any(|w| {
+        NEEDLE
+            .iter()
+            .enumerate()
+            .all(|(i, &c)| w[i * 2].eq_ignore_ascii_case(&c) && w[i * 2 + 1] == 0)
+    })
 }
 
 /// Anti-cheat present in the install tree, by the files those systems ship.
@@ -599,6 +622,117 @@ pub fn game_ships_dlss(game_dir: &Path) -> bool {
     }
 }
 
+/// Unreal-style layout: `…/Binaries/Win64` or a `-Shipping.exe` next to UE folders.
+pub fn unreal_likely(exe: &Path, game_dir: &Path) -> bool {
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if stem.contains("-shipping") || stem.ends_with("shipping") {
+        return true;
+    }
+    if game_dir
+        .parent()
+        .and_then(|b| b.file_name())
+        .is_some_and(|n| n.eq_ignore_ascii_case("binaries"))
+    {
+        return true;
+    }
+    let proj = game_dir
+        .parent()
+        .filter(|b| {
+            b.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("binaries"))
+        })
+        .and_then(|b| b.parent());
+    if let Some(proj) = proj {
+        if proj.join("Plugins").is_dir() || proj.join("Content").is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+/// UnityPlayer.dll beside the exe (or one folder up for some layouts).
+pub fn unity_likely(game_dir: &Path) -> bool {
+    game_dir.join("UnityPlayer.dll").is_file()
+        || game_dir
+            .parent()
+            .is_some_and(|p| p.join("UnityPlayer.dll").is_file())
+}
+
+/// Lightweight install-time RT / ray-reconstruction hints (not a DXR hook).
+/// Looks for known ini keys, folder names, and `nvngx_dlssd.dll`.
+pub fn rt_likely(game_dir: &Path) -> bool {
+    fn name_hit(n: &str) -> bool {
+        let n = n.to_ascii_lowercase();
+        n.contains("raytracing")
+            || n.contains("ray_tracing")
+            || n.contains("rtxgi")
+            || n.contains("dlssd")
+            || n == "nvngx_dlssd.dll"
+            || n.contains("lumen") && n.contains("hardware")
+    }
+    fn walk_names(d: &Path, depth: u8) -> bool {
+        let Ok(rd) = fs::read_dir(d) else {
+            return false;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let n = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if name_hit(&n) {
+                return true;
+            }
+            if p.is_file()
+                && (n.ends_with(".ini") || n.ends_with(".cfg") || n.ends_with(".txt"))
+                && file_mentions_rt(&p)
+            {
+                return true;
+            }
+            if depth > 0 && p.is_dir() && !n.starts_with('.') && walk_names(&p, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    fn file_mentions_rt(p: &Path) -> bool {
+        let Ok(s) = fs::read_to_string(p) else {
+            return false;
+        };
+        // Cap read cost: only scan first ~64 KiB worth of UTF-8 lossy via take on chars.
+        let head: String = s.chars().take(64 * 1024).collect();
+        let l = head.to_ascii_lowercase();
+        l.contains("hardwareraytracing")
+            || l.contains("r.raytracing")
+            || l.contains("raytracing=")
+            || l.contains("ray tracing")
+            || l.contains("dlss-rr")
+            || l.contains("rayreconstruction")
+    }
+    if walk_names(game_dir, 3) {
+        return true;
+    }
+    // Unreal Plugins tree
+    if let Some(proj) = game_dir
+        .parent()
+        .filter(|b| {
+            b.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("binaries"))
+        })
+        .and_then(Path::parent)
+    {
+        if walk_names(&proj.join("Plugins"), 5) {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone)]
 pub struct GameStatus {
     pub mode: Mode,
@@ -625,6 +759,12 @@ pub struct GameStatus {
     pub reframework: bool,
     /// matiasLombo's neural-upstream add-on is in the folder.
     pub upstream: bool,
+    /// Unreal-style layout / Shipping exe (heuristic).
+    pub unreal_likely: bool,
+    /// UnityPlayer.dll present (heuristic).
+    pub unity_likely: bool,
+    /// RT / DLSS-D / raytracing markers on disk (heuristic — not live DXR state).
+    pub rt_likely: bool,
     /// RenoDX game mod this tool installed, from its manifest.
     pub renodx_mod: Option<String>,
     /// Other RenoDX game mods found in the folder (not ours, not the DLSS 5 add-on).
@@ -691,6 +831,10 @@ impl GameStatus {
 
     pub fn is32(&self) -> bool {
         self.bitness == 32
+    }
+    /// DX9 without dgVoodoo2 yet: Install will download it into the game folder.
+    pub fn needs_dgvoodoo(&self) -> bool {
+        self.api == Api::Dx9 && !is_dgvoodoo(self.game_dir())
     }
     /// Where the DLSS 5 add-on and the NVIDIA DLLs live: beside the exe for a
     /// 64-bit game, in `host64\` for a 32-bit one.
@@ -762,23 +906,14 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     // Feeder (verified working on Dead or Alive 5 Last Round, #17).
     if d.join("d3d9.dll").is_file() && !d.join(RESHADE_PROXY).is_file() && !is_dgvoodoo(d) {
         problems.push(
-            "A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead              end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.3 (MS\\x86\\D3D9.dll plus dgVoodoo.conf,              OutputAPI = bestavailable) and run Install again."
+            "A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead              end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.3 (MS\\x86 or MS\\x64\\D3D9.dll plus              dgVoodoo.conf, OutputAPI = d3d11_fl11_0, VRAM >= 4096) and run Install again."
                 .into(),
         );
     }
     let api = detect_api(exe);
-    if api == Api::Dx9 {
-        problems.push(
-            "This is a DirectX 9 game. DLSS needs a Direct3D 11 or 12 device, which D3D9 \
-             never creates, so nothing here can attach to it as it stands -- and the game \
-             loads the system d3d9.dll by name, so the dxgi.dll this tool installs is never \
-             even asked for (no ReShade overlay, no ReShade.log). The route that works is \
-             dgVoodoo 2.87.3 first: it turns D3D9 into D3D11, and everything else follows \
-             from there. Put its D3D9.dll from the MS/x86 folder beside the exe with \
-             OutputAPI = bestavailable, confirm the game still starts, then run Install again."
-                .into(),
-        );
-    }
+    // Plain D3D9 (Gothic 3, Aion, etc.): ReShade is dxgi.dll here, which a
+    // D3D9 process never loads. Install adds official dgVoodoo 2.87.3 so DX9
+    // is not a hard refuse. A foreign non-dgVoodoo d3d9.dll still blocks above.
     let is32 = bitness == 32;
     if is32 && api == Api::Dx12 {
         problems.push(
@@ -834,6 +969,9 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         host_reshade: is32 && is_reshade_dll(&cdir.join(RESHADE_PROXY)),
         re_engine: d.join(RE_ENGINE_PAK).is_file(),
         reframework: d.join(REFRAMEWORK_DLL).is_file(),
+        unreal_likely: unreal_likely(exe, d),
+        unity_likely: unity_likely(d),
+        rt_likely: rt_likely(d),
         renodx_mod: renodx_mod.clone(),
         foreign_renodx: crate::renodx::foreign_mods(d, renodx_mod.as_deref()),
         anticheat,
@@ -982,10 +1120,124 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Accepts either a game exe or a game folder; returns the exe to use plus
-/// every candidate found (empty when the input was already an exe).
-/// Did this tool install into this folder? True when any marker or manifest
-/// it writes is present. Used to group those games together (#nn) and to
-/// decide whether a component may be refreshed.
+/// every candidate found.
+///
+/// When the input is a **file** (e.g. a 500 KB Unreal bootstrapper next to a
+/// `Game\Binaries\Win64\*-Shipping.exe`), we still search the parent tree so
+/// Install lands next to the real game — not the launcher (Ghostrunner).
+pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
+    if input.is_file() {
+        let mut search_roots: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = input.parent() {
+            search_roots.push(parent.to_path_buf());
+            // Unreal: …/Ghostrunner/Ghostrunner.exe → search parent (and grandparent
+            // when Shipping lives under a same-named subfolder one level up).
+            if let Some(grand) = parent.parent() {
+                search_roots.push(grand.to_path_buf());
+            }
+        }
+        let mut cands: Vec<PathBuf> = Vec::new();
+        for root in &search_roots {
+            for e in find_game_exes(root) {
+                if !cands.iter().any(|c| c == &e) {
+                    cands.push(e);
+                }
+            }
+        }
+        if cands.is_empty() {
+            // Fall back: the file itself (may be the only PE).
+            return Ok((input.to_path_buf(), Vec::new()));
+        }
+        // Re-rank across roots: Shipping first, then 64-bit, then size.
+        cands = rank_exe_candidates(cands);
+        let best = cands[0].clone();
+        return Ok((best, cands));
+    }
+    if input.is_dir() {
+        let c = find_game_exes(input);
+        return match c.first() {
+            Some(first) => Ok((first.clone(), c)),
+            None => bail!("no 64-bit game executable found in {}", input.display()),
+        };
+    }
+    bail!("not found: {}", input.display())
+}
+
+fn rank_exe_candidates(found: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut scored: Vec<(i64, PathBuf)> = found
+        .into_iter()
+        .filter_map(|p| {
+            let stem = p.file_stem()?.to_str()?.to_ascii_lowercase();
+            if is_helper_name(&stem) {
+                return None;
+            }
+            let bits = exe_bitness(&p).ok()?;
+            // Keep 32-bit DX9 titles; prefer 64-bit when both exist.
+            let size = fs::metadata(&p).map(|m| m.len()).unwrap_or(0) as i64;
+            let mut score: i64 = 0;
+            if stem.ends_with("-shipping") {
+                score += 2_000_000_000;
+            }
+            if bits == 64 {
+                score += 500_000_000;
+            }
+            score += size.min(400_000_000);
+            Some((score, p))
+        })
+        .collect();
+    scored.sort_by_key(|s| std::cmp::Reverse(s.0));
+    scored.into_iter().map(|(_, p)| p).collect()
+}
+
+/// True when ReShade/Feeder markers sit on a launcher folder but the preferred
+/// Shipping exe's directory has neither — classic wrong-folder Install.
+pub fn install_folder_mismatch(preferred_exe: &Path) -> Option<String> {
+    let ship_dir = preferred_exe.parent()?;
+    let ship_ok = ship_dir.join(RESHADE_PROXY).is_file() || ship_dir.join(FEEDER_ADDON).is_file();
+    if ship_ok {
+        return None;
+    }
+    // Walk up looking for a sibling/parent that has our install but is not ship_dir.
+    let mut cur = ship_dir.parent();
+    for _ in 0..4 {
+        let Some(d) = cur else { break };
+        if (d.join(RESHADE_PROXY).is_file() || d.join(FEEDER_MARKER).is_file())
+            && d != ship_dir
+        {
+            return Some(format!(
+                "ReShade/Feeder found in {} but not next to {} — Install on the Shipping exe",
+                d.display(),
+                preferred_exe
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("game.exe")
+            ));
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// True when EffectSearchPaths point at a missing/empty Shaders folder.
+pub fn shaders_missing(game_dir: &Path) -> bool {
+    let sh = game_dir.join("reshade-shaders").join("Shaders");
+    if !sh.is_dir() {
+        return game_dir.join(RESHADE_PROXY).is_file();
+    }
+    fs::read_dir(&sh)
+        .ok()
+        .map(|rd| {
+            !rd.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("fx"))
+            })
+        })
+        .unwrap_or(true)
+        && game_dir.join(RESHADE_PROXY).is_file()
+}
+
+/// Sidecar markers this tool leaves so Install / Update / Remove know the folder.
 pub fn installed_by_tool(dir: &Path) -> bool {
     [
         OPTI_MANIFEST,
@@ -998,20 +1250,6 @@ pub fn installed_by_tool(dir: &Path) -> bool {
     ]
     .iter()
     .any(|m| dir.join(m).is_file())
-}
-
-pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
-    if input.is_file() {
-        return Ok((input.to_path_buf(), Vec::new()));
-    }
-    if input.is_dir() {
-        let c = find_game_exes(input);
-        return match c.first() {
-            Some(first) => Ok((first.clone(), c)),
-            None => bail!("no game executable found in {}", input.display()),
-        };
-    }
-    bail!("not found: {}", input.display())
 }
 
 #[cfg(test)]
@@ -1097,6 +1335,67 @@ pub mod testutil {
         img[sh + 20..sh + 24].copy_from_slice(&(SEC as u32).to_le_bytes()); // PointerToRawData
         img.extend_from_slice(&blob);
         fs::write(path, &img).unwrap();
+        path.to_path_buf()
+    }
+
+    /// Minimal PE with a real import directory so `pe_imports` / `detect_api`
+    /// can see sibling engine DLLs the way Gothic 3 does (exe → Engine.dll → d3d9).
+    pub fn make_pe_with_imports(path: &Path, machine: u16, dlls: &[&str]) -> PathBuf {
+        let pe32 = machine == PE_X86;
+        let opt_magic: u16 = if pe32 { 0x10B } else { 0x20B };
+        // Standard optional header sizes including 16 data directories.
+        let opt_size: u16 = if pe32 { 224 } else { 240 };
+        let sect_raw = 0x400usize;
+        let sect_va = 0x1000usize;
+
+        let mut names_blob = Vec::new();
+        let mut name_rvas = Vec::new();
+        // Descriptors first (20 bytes each + null), then the DLL name strings.
+        let desc_bytes = (dlls.len() + 1) * 20;
+        for dll in dlls {
+            name_rvas.push(sect_va + desc_bytes + names_blob.len());
+            names_blob.extend_from_slice(dll.as_bytes());
+            names_blob.push(0);
+        }
+        let mut idata = vec![0u8; desc_bytes];
+        for (i, &rva) in name_rvas.iter().enumerate() {
+            let off = i * 20;
+            idata[off + 12..off + 16].copy_from_slice(&(rva as u32).to_le_bytes());
+        }
+        idata.extend_from_slice(&names_blob);
+        while idata.len() % 16 != 0 {
+            idata.push(0);
+        }
+
+        let mut file = vec![0u8; sect_raw + idata.len()];
+        file[0] = b'M';
+        file[1] = b'Z';
+        file[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+
+        let pe = 0x80usize;
+        file[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        file[pe + 4..pe + 6].copy_from_slice(&machine.to_le_bytes());
+        file[pe + 6..pe + 8].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
+        file[pe + 20..pe + 22].copy_from_slice(&opt_size.to_le_bytes());
+
+        let opt = pe + 24;
+        file[opt..opt + 2].copy_from_slice(&opt_magic.to_le_bytes());
+        // DataDirectory[1] = Import (Export is [0] at +0/+4; Import follows at +8).
+        let dd_base = opt + if pe32 { 96 } else { 112 };
+        let n_dirs = dd_base - 4; // NumberOfRvaAndSizes sits just before the dirs
+        file[n_dirs..n_dirs + 4].copy_from_slice(&16u32.to_le_bytes());
+        file[dd_base + 8..dd_base + 12].copy_from_slice(&(sect_va as u32).to_le_bytes());
+        file[dd_base + 12..dd_base + 16].copy_from_slice(&(idata.len() as u32).to_le_bytes());
+
+        let sec = opt + opt_size as usize;
+        file[sec..sec + 8].copy_from_slice(b".idata\0\0");
+        file[sec + 8..sec + 12].copy_from_slice(&(idata.len() as u32).to_le_bytes()); // VirtualSize
+        file[sec + 12..sec + 16].copy_from_slice(&(sect_va as u32).to_le_bytes());
+        file[sec + 16..sec + 20].copy_from_slice(&(idata.len() as u32).to_le_bytes()); // SizeOfRawData
+        file[sec + 20..sec + 24].copy_from_slice(&(sect_raw as u32).to_le_bytes());
+
+        file[sect_raw..sect_raw + idata.len()].copy_from_slice(&idata);
+        fs::write(path, file).unwrap();
         path.to_path_buf()
     }
 
@@ -1340,6 +1639,7 @@ mod tests {
             classify_imports(&s(&["d3d10_1.dll", "d3d12.dll"])),
             Api::Dx12
         );
+        assert_eq!(classify_imports(&s(&["d3d9.dll"])), Api::Dx9);
         assert_eq!(classify_imports(&s(&["kernel32.dll"])), Api::Unknown);
     }
 
@@ -1429,6 +1729,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_target_launcher_file_prefers_shipping() {
+        // Ghostrunner-style: root launcher + Shipping under Game\Binaries\Win64.
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Ghostrunner");
+        let bin = d.join("Ghostrunner").join("Binaries").join("Win64");
+        fs::create_dir_all(&bin).unwrap();
+        let launcher = make_pe(&d.join("Ghostrunner.exe"), PE_X64);
+        let shipping = make_pe(&bin.join("Ghostrunner-Win64-Shipping.exe"), PE_X64);
+        // Passing the launcher FILE must still resolve to Shipping.
+        let (exe, all) = resolve_target(&launcher).unwrap();
+        assert_eq!(exe, shipping);
+        assert!(all.contains(&shipping));
+        assert!(all.contains(&launcher));
+    }
+
+    #[test]
     fn find_game_exes_unreal_layout_prefers_shipping() {
         let t = tempfile::tempdir().unwrap();
         let d = t.path().join("SomeGame");
@@ -1479,6 +1795,65 @@ mod tests {
         assert_eq!(detect_api(&exe), Api::Unknown);
     }
 
+    /// Gothic 3: the exe has no Direct3D imports; Engine.dll does (d3d9.dll).
+    /// Sibling scan must surface Dx9; Install is allowed and will fetch dgVoodoo.
+    #[test]
+    fn detect_api_reads_dx9_from_sibling_engine_dll() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe_with_imports(&d.join("Gothic3.exe"), PE_X86, &["engine.dll"]);
+        make_pe_with_imports(
+            &d.join("Engine.dll"),
+            PE_X86,
+            &["d3d9.dll", "d3dx9_40.dll", "kernel32.dll"],
+        );
+        assert_eq!(pe_imports(&exe), vec!["engine.dll".to_string()]);
+        assert!(pe_imports(&d.join("Engine.dll")).contains(&"d3d9.dll".to_string()));
+        assert_eq!(detect_api(&exe), Api::Dx9);
+
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        let st = inspect(&exe).unwrap();
+        assert_eq!(st.api, Api::Dx9);
+        assert!(st.needs_dgvoodoo(), "DX9 without dgVoodoo should need the install step");
+        assert!(
+            !st.problems.iter().any(|p| p.contains("DirectX 9")),
+            "DX9 without dgVoodoo must not hard-block Install: {:?}",
+            st.problems
+        );
+
+        fs::write(d.join("dgVoodoo.conf"), b"[General]\nOutputAPI = bestavailable\n").unwrap();
+        let st = inspect(&exe).unwrap();
+        assert_eq!(st.api, Api::Dx9);
+        assert!(!st.needs_dgvoodoo());
+        assert!(
+            !st.problems.iter().any(|p| p.contains("DirectX 9")),
+            "dgVoodoo present should stay clear: {:?}",
+            st.problems
+        );
+    }
+
+    /// Live check against a local Gothic 3 install when present.
+    #[test]
+    fn gothic3_live_detects_dx9_and_allows_install_without_dgvoodoo() {
+        let exe = std::path::Path::new(r"D:\Games\Gothic 3\Gothic3.exe");
+        if !exe.is_file() {
+            return;
+        }
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        assert_eq!(detect_api(exe), Api::Dx9, "Gothic3.exe must classify as DX9");
+        assert_eq!(detect_api(exe).label(), "DX9");
+        let st = inspect(exe).unwrap();
+        assert_eq!(st.api, Api::Dx9);
+        assert_eq!(st.bitness, 32);
+        let has_dg = is_dgvoodoo(exe.parent().unwrap());
+        assert_eq!(st.needs_dgvoodoo(), !has_dg);
+        assert!(
+            !st.problems.iter().any(|p| p.contains("DirectX 9")),
+            "Gothic 3 must not hard-block on missing dgVoodoo: {:?}",
+            st.problems
+        );
+    }
+
     #[test]
     fn dgvoodoo_d3d9_is_allowed_other_d3d9_is_not() {
         let t = tempfile::tempdir().unwrap();
@@ -1501,6 +1876,38 @@ mod tests {
         fs::remove_file(d.join("dgVoodoo.conf")).unwrap();
         fs::write(d.join("d3d9.dll"), b"MZ...dgVoodoo2 wrapper...").unwrap();
         assert!(is_dgvoodoo(d));
+    }
+
+    #[test]
+    fn dx9_needs_dgvoodoo_helper() {
+        assert_eq!(classify_imports(&["d3d9.dll".into()]), Api::Dx9);
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        assert!(!is_dgvoodoo(d));
+        fs::write(d.join("dgVoodoo.conf"), b"[General]\nOutputAPI = bestavailable\n").unwrap();
+        assert!(is_dgvoodoo(d));
+    }
+
+    /// A renamed old ReShade (`d3d9.dll.off`) must not count as dgVoodoo.
+    #[test]
+    fn d3d9_off_is_not_dgvoodoo() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        fs::write(d.join("d3d9.dll.off"), b"MZ old reshade").unwrap();
+        assert!(!is_dgvoodoo(d));
+    }
+
+    #[test]
+    fn dll_mentions_dgvoodoo_ascii_and_utf16() {
+        assert!(dll_mentions_dgvoodoo(b"MZ...dgVoodoo2 wrapper..."));
+        assert!(!dll_mentions_dgvoodoo(b"MZ some other wrapper"));
+        // Official 2.87.3 MS/x86/D3D9.dll embeds the name as UTF-16LE only.
+        let mut utf16 = b"MZ\0\0".to_vec();
+        for &c in b"dgVoodoo" {
+            utf16.push(c);
+            utf16.push(0);
+        }
+        assert!(dll_mentions_dgvoodoo(&utf16));
     }
 
     #[test]
@@ -1566,5 +1973,33 @@ mod tests {
         fs::write(sh.join(LUMENITE_KERNEL_FX), "technique Lumenite_Kernel {}").unwrap();
         fs::write(tx.join(LUMENITE_BLUENOISE), b"png").unwrap();
         assert!(inspect(&exe).unwrap().complete());
+    }
+
+    #[test]
+    fn unity_and_rt_likely_heuristics() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), PE_X64);
+        assert!(!unity_likely(d));
+        assert!(!rt_likely(d));
+        fs::write(d.join("UnityPlayer.dll"), b"MZ").unwrap();
+        assert!(unity_likely(d));
+        fs::write(d.join("nvngx_dlssd.dll"), b"x").unwrap();
+        assert!(rt_likely(d));
+        let st = {
+            std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+            inspect(&exe).unwrap()
+        };
+        assert!(st.unity_likely);
+        assert!(st.rt_likely);
+    }
+
+    #[test]
+    fn unreal_likely_from_binaries_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let win64 = t.path().join("MyGame").join("Binaries").join("Win64");
+        fs::create_dir_all(&win64).unwrap();
+        let exe = make_pe(&win64.join("MyGame-Win64-Shipping.exe"), PE_X64);
+        assert!(unreal_likely(&exe, &win64));
     }
 }
