@@ -3,6 +3,7 @@
 mod diagnose;
 mod feeder_cfg;
 mod game;
+mod game_overrides;
 mod gpu;
 mod gpupref;
 mod gui;
