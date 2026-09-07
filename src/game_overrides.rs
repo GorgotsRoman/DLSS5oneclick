@@ -27,6 +27,7 @@ pub struct GameOverride {
     pub engine_velocity: Option<bool>,
     pub early_color: Option<bool>,
     pub early_color_cand: Option<i32>,
+    pub async_feed: Option<bool>,
     pub reset_mode: Option<i32>,
     pub light_stab: Option<bool>,
     pub light_stab_strength: Option<f32>,
@@ -113,6 +114,9 @@ pub fn apply_to_cfg_text(cfg: &str, o: &GameOverride) -> String {
     }
     if let Some(v) = o.early_color_cand {
         set("early_color_cand", v.to_string());
+    }
+    if let Some(v) = o.async_feed {
+        set("async_feed", (v as i32).to_string());
     }
     if let Some(v) = o.reset_mode {
         set("reset_mode", v.to_string());

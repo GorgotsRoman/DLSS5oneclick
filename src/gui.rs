@@ -161,13 +161,15 @@ struct GameMeta {
     exe: PathBuf,
     /// Feeder early_color=1 in cfg (seed/active request); in-game may still fallback Present.
     early_color: bool,
+    /// Feeder async_feed=1 — display lag ~1 frame.
+    async_feed: bool,
 }
 
 fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
     let dir = st.game_dir();
-    let early_color = feeder_cfg::load(dir)
-        .map(|k| k.early_color)
-        .unwrap_or(false);
+    let knobs = feeder_cfg::load(dir).ok();
+    let early_color = knobs.as_ref().map(|k| k.early_color).unwrap_or(false);
+    let async_feed = knobs.as_ref().map(|k| k.async_feed).unwrap_or(false);
     GameMeta {
         api: match st.api {
             game::Api::Vulkan => "Vulkan",
@@ -197,6 +199,7 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
         wrong_folder: game::install_folder_mismatch(&st.exe),
         exe: st.exe.clone(),
         early_color,
+        async_feed,
     }
 }
 
@@ -1529,6 +1532,14 @@ impl App {
                         ""
                     },
                 ),
+                (
+                    m.async_feed,
+                    if m.async_feed {
+                        "Async ~1f"
+                    } else {
+                        ""
+                    },
+                ),
                 (m.ready && m.stale.is_empty(), ready_label),
             ] {
                 if label.is_empty() {
@@ -1941,6 +1952,12 @@ impl App {
                     "early_color (D3D11 SceneColor; off = Present)",
                 )
                 .changed();
+            changed |= ui
+                .checkbox(
+                    &mut k.async_feed,
+                    "async_feed (D3D11; ~1 frame display lag; off = sync)",
+                )
+                .changed();
             ui.label(
                 RichText::new(if k.early_color {
                     "Color path: Early color active (Feeder confirms snap in-game; else fallback Present)"
@@ -1950,6 +1967,13 @@ impl App {
                 .font(t::plex(11.0))
                 .color(t::TEXT_SOFT),
             );
+            if k.async_feed {
+                ui.label(
+                    RichText::new("Async feed ON · display lag ~1 frame (not an FPS delay)")
+                        .font(t::plex(11.0))
+                        .color(t::TEXT_SOFT),
+                );
+            }
             changed |= ui
                 .add(egui::Slider::new(&mut k.evaluate_stride, 1..=4).text("evaluate_stride"))
                 .changed();

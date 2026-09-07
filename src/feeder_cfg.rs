@@ -24,6 +24,8 @@ pub struct FeederKnobs {
     /// D3D11 SceneColor snap → SLOT_COLOR (Feeder); off by default.
     pub early_color: bool,
     pub early_color_cand: i32,
+    /// D3D11 async feed (~1 frame display lag); off by default.
+    pub async_feed: bool,
     pub evaluate_stride: i32,
     pub log_detail: i32,
     pub appearance_mask: bool,
@@ -51,6 +53,7 @@ impl Default for FeederKnobs {
             engine_velocity: true,
             early_color: false,
             early_color_cand: -1,
+            async_feed: false,
             evaluate_stride: 1,
             log_detail: 1,
             appearance_mask: true,
@@ -157,6 +160,7 @@ pub fn load(game_dir: &Path) -> Result<FeederKnobs> {
     k.engine_velocity = get_i(&kv, "engine_velocity", 1) != 0;
     k.early_color = get_i(&kv, "early_color", 0) != 0;
     k.early_color_cand = get_i(&kv, "early_color_cand", -1);
+    k.async_feed = get_i(&kv, "async_feed", 0) != 0;
     k.evaluate_stride = get_i(&kv, "evaluate_stride", k.evaluate_stride).clamp(1, 4);
     k.log_detail = get_i(&kv, "log_detail", k.log_detail);
     k.auto_profile = get_s(&kv, "auto_profile");
@@ -236,6 +240,11 @@ pub fn save(game_dir: &Path, k: &FeederKnobs) -> Result<()> {
         &mut lines,
         "early_color_cand",
         k.early_color_cand.to_string(),
+    );
+    set_line(
+        &mut lines,
+        "async_feed",
+        (k.async_feed as i32).to_string(),
     );
     set_line(
         &mut lines,
