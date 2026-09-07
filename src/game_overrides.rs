@@ -4,9 +4,14 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const EMBEDDED: &str = include_str!("../assets/game_overrides.json");
+
+const UE_TAA_OFF_BLOCK: &str = "\
+; DLSS5oneclick — reduce double temporal with Feeder Present path\n\
+r.AntiAliasingMethod=0\n\
+r.PostProcessAAQuality=0\n";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GameOverride {
@@ -20,12 +25,20 @@ pub struct GameOverride {
     pub ofa_grid: Option<i32>,
     pub ofa_perf: Option<i32>,
     pub engine_velocity: Option<bool>,
+    pub early_color: Option<bool>,
+    pub early_color_cand: Option<i32>,
     pub reset_mode: Option<i32>,
     pub light_stab: Option<bool>,
     pub light_stab_strength: Option<f32>,
     pub light_stab_max_delta: Option<f32>,
     pub work_resolution: Option<i32>,
     pub auto_profile_applied: Option<i32>,
+    /// Write Unreal Engine.ini TAA-off hint under Saved/Config when possible.
+    pub taa_off: Option<bool>,
+    /// Shown on Setup after Install (and when caps list Unreal-likely).
+    pub setup_tip: Option<String>,
+    /// Games with own DLSS: prefer Opti/RenoDX/Upstream — do not Force Feeder.
+    pub prefer_native_engine: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +108,12 @@ pub fn apply_to_cfg_text(cfg: &str, o: &GameOverride) -> String {
     if let Some(v) = o.engine_velocity {
         set("engine_velocity", (v as i32).to_string());
     }
+    if let Some(v) = o.early_color {
+        set("early_color", (v as i32).to_string());
+    }
+    if let Some(v) = o.early_color_cand {
+        set("early_color_cand", v.to_string());
+    }
     if let Some(v) = o.reset_mode {
         set("reset_mode", v.to_string());
         set("reset_every", if v == 1 { "1" } else { "0" }.into());
@@ -122,6 +141,89 @@ pub fn apply_to_cfg_text(cfg: &str, o: &GameOverride) -> String {
     out
 }
 
+/// Walk up from Shipping exe looking for `Saved` or project root with Binaries.
+fn unreal_project_root(exe: &Path) -> Option<PathBuf> {
+    let mut cur = exe.parent()?;
+    for _ in 0..8 {
+        let saved = cur.join("Saved");
+        if saved.is_dir() {
+            return Some(cur.to_path_buf());
+        }
+        // …/Game/Binaries/Win64 → project is parent of Binaries' parent
+        if cur
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("Win64") || n.eq_ignore_ascii_case("WinGDK"))
+        {
+            if let Some(binaries) = cur.parent() {
+                if binaries
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case("Binaries"))
+                {
+                    if let Some(project) = binaries.parent() {
+                        if project.join("Saved").exists() || project.join("Content").exists() {
+                            return Some(project.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+        cur = cur.parent()?;
+    }
+    None
+}
+
+/// Merge TAA-off cvars into Saved/Config Engine.ini (WindowsNoEditor + Windows).
+pub fn apply_ue_taa_off(exe: &Path) -> Result<Option<String>> {
+    let Some(root) = unreal_project_root(exe) else {
+        return Ok(None);
+    };
+    let mut written = Vec::new();
+    for sub in [
+        "Saved/Config/WindowsNoEditor/Engine.ini",
+        "Saved/Config/Windows/Engine.ini",
+    ] {
+        let path = root.join(sub);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let prev = if path.is_file() {
+            fs::read_to_string(&path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if prev.contains("r.AntiAliasingMethod=0") {
+            continue;
+        }
+        let mut next = prev;
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        if !next.contains("[SystemSettings]") {
+            next.push_str("\n[SystemSettings]\n");
+        }
+        if let Some(idx) = next.find("[SystemSettings]") {
+            let insert_at = idx + "[SystemSettings]".len();
+            next.insert_str(insert_at, &format!("\n{UE_TAA_OFF_BLOCK}"));
+        } else {
+            next.push_str(&format!("[SystemSettings]\n{UE_TAA_OFF_BLOCK}"));
+        }
+        fs::write(&path, next).with_context(|| format!("writing {}", path.display()))?;
+        written.push(path.display().to_string());
+    }
+    if written.is_empty() {
+        Ok(Some(
+            "Engine.ini already has r.AntiAliasingMethod=0 (TAA-off)".into(),
+        ))
+    } else {
+        Ok(Some(format!(
+            "Wrote Unreal TAA-off hint → {}",
+            written.join(", ")
+        )))
+    }
+}
+
 /// After Feeder cfg is written, apply a matching override (if any). Returns a log line.
 pub fn apply_for_game(game_dir: &Path, exe: &Path) -> Result<Option<String>> {
     let Some(o) = find_override(exe) else {
@@ -134,12 +236,19 @@ pub fn apply_for_game(game_dir: &Path, exe: &Path) -> Result<Option<String>> {
     let prev = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let next = apply_to_cfg_text(&prev, &o);
     fs::write(&path, next).with_context(|| format!("writing {}", path.display()))?;
-    let note = if o.note.is_empty() {
-        "game override applied".into()
+
+    let mut parts = Vec::new();
+    if o.note.is_empty() {
+        parts.push("game override applied".into());
     } else {
-        format!("game override: {}", o.note)
-    };
-    Ok(Some(note))
+        parts.push(format!("game override: {}", o.note));
+    }
+    if o.taa_off == Some(true) {
+        if let Some(msg) = apply_ue_taa_off(exe)? {
+            parts.push(msg);
+        }
+    }
+    Ok(Some(parts.join(" · ")))
 }
 
 /// Generic RT-likely seed: slightly stronger LightStab (does not require a named override).
@@ -174,6 +283,7 @@ mod tests {
         let o = find_override(&exe).expect("gothic override");
         assert_eq!(o.work_resolution, Some(100));
         assert_eq!(o.reset_mode, Some(1));
+        assert_eq!(o.engine_velocity, Some(false));
     }
 
     #[test]
@@ -181,6 +291,48 @@ mod tests {
         let exe = PathBuf::from(r"D:\torrent\The Sims 4\Game\Bin\TS4_x64.exe");
         let o = find_override(&exe).expect("sims override");
         assert_eq!(o.work_resolution, Some(75));
+    }
+
+    #[test]
+    fn mass_effect_disables_engine_velocity() {
+        let exe = PathBuf::from(
+            r"D:\Games\Mass Effect Legendary Edition\Game\ME1\Binaries\Win64\MassEffect1.exe",
+        );
+        let o = find_override(&exe).expect("me override");
+        assert_eq!(o.engine_velocity, Some(false));
+        assert_eq!(o.early_color, Some(false));
+    }
+
+    #[test]
+    fn ghostrunner_taa_off_seed() {
+        let exe = PathBuf::from(
+            r"D:\Games\Ghostrunner\Ghostrunner\Binaries\Win64\Ghostrunner-Win64-Shipping.exe",
+        );
+        let o = find_override(&exe).expect("ghostrunner");
+        assert_eq!(o.taa_off, Some(true));
+        assert_eq!(o.early_color, Some(false));
+    }
+
+    #[test]
+    fn witcher_seeds_early_color() {
+        let exe = PathBuf::from(r"D:\Games\The Witcher 3\bin\x64\witcher3.exe");
+        let o = find_override(&exe).expect("w3");
+        assert_eq!(o.early_color, Some(true));
+    }
+
+    #[test]
+    fn apply_patches_early_color() {
+        let o = GameOverride {
+            early_color: Some(true),
+            early_color_cand: Some(2),
+            engine_velocity: Some(false),
+            ..Default::default()
+        };
+        let cfg = "enabled=1\nwork_resolution=100\n";
+        let out = apply_to_cfg_text(cfg, &o);
+        assert!(out.contains("early_color=1"));
+        assert!(out.contains("early_color_cand=2"));
+        assert!(out.contains("engine_velocity=0"));
     }
 
     #[test]

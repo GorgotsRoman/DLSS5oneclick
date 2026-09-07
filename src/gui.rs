@@ -159,10 +159,15 @@ struct GameMeta {
     wrong_folder: Option<String>,
     /// Canonical Shipping (or best) exe.
     exe: PathBuf,
+    /// Feeder early_color=1 in cfg (seed/active request); in-game may still fallback Present.
+    early_color: bool,
 }
 
 fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
     let dir = st.game_dir();
+    let early_color = feeder_cfg::load(dir)
+        .map(|k| k.early_color)
+        .unwrap_or(false);
     GameMeta {
         api: match st.api {
             game::Api::Vulkan => "Vulkan",
@@ -191,6 +196,7 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
         shaders_missing: game::shaders_missing(dir),
         wrong_folder: game::install_folder_mismatch(&st.exe),
         exe: st.exe.clone(),
+        early_color,
     }
 }
 
@@ -1513,8 +1519,21 @@ impl App {
             for (on, label) in [
                 (m.has_dlss, dlss_label),
                 (m.addon || m.installed, m.engine_path),
+                (
+                    m.early_color,
+                    if m.early_color {
+                        "Early color"
+                    } else if m.addon || m.installed {
+                        "Present"
+                    } else {
+                        ""
+                    },
+                ),
                 (m.ready && m.stale.is_empty(), ready_label),
             ] {
+                if label.is_empty() {
+                    continue;
+                }
                 let cy = band.center().y;
                 p.circle_filled(
                     egui::pos2(x + 3.0, cy),
@@ -1917,6 +1936,21 @@ impl App {
                 .checkbox(&mut k.engine_velocity, "engine_velocity")
                 .changed();
             changed |= ui
+                .checkbox(
+                    &mut k.early_color,
+                    "early_color (D3D11 SceneColor; off = Present)",
+                )
+                .changed();
+            ui.label(
+                RichText::new(if k.early_color {
+                    "Color path: Early color active (Feeder confirms snap in-game; else fallback Present)"
+                } else {
+                    "Color path: fallback Present"
+                })
+                .font(t::plex(11.0))
+                .color(t::TEXT_SOFT),
+            );
+            changed |= ui
                 .add(egui::Slider::new(&mut k.evaluate_stride, 1..=4).text("evaluate_stride"))
                 .changed();
             changed |= ui
@@ -2080,6 +2114,17 @@ fn about_page(ui: &mut egui::Ui) {
         ))
         .font(t::plex(12.5))
         .color(t::TEXT_SOFT),
+    );
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(
+            "Paths (honest): Native DLSS games → Opti / RenoDX / Upstream (hooks the game’s own DLSS). \
+             Games without DLSS → Feeder Present path (NR on the finished frame). \
+             Optional early color (D3D11 SceneColor snap, off by default) can feed before post/TAA when a \
+             candidate RT is found; otherwise Feeder falls back to Present. DX9/12 early inject is not claimed yet.",
+        )
+        .font(t::plex(12.0))
+        .color(t::TEXT_MUTED),
     );
     ui.add_space(6.0);
     ui.label(RichText::new("Everything it installs is downloaded from the projects that made it. Credits and sources:").font(t::plex(12.0)).color(t::TEXT_MUTED));
@@ -2650,14 +2695,16 @@ impl eframe::App for App {
                             let name = |m: Option<game::Mode>| match m {
                                 None => match s.mode_detected {
                                     game::Mode::Native => {
-                                        "Auto: native DLSS · renodx hooks game (Feeder Optimize N/A)"
+                                        "Auto: native DLSS · Opti / RenoDX / Upstream (not Feeder)"
                                     }
-                                    game::Mode::Feeder => "Auto: no DLSS · Feeder path + Optimize",
+                                    game::Mode::Feeder => "Auto: no DLSS · Feeder Present path + Optimize",
                                 },
                                 Some(game::Mode::Native) => {
-                                    "Force native DLSS (Feeder Optimize N/A)"
+                                    "Force native DLSS (Opti / RenoDX — Feeder Optimize N/A)"
                                 }
-                                Some(game::Mode::Feeder) => "Force no-DLSS (Feeder + Optimize)",
+                                Some(game::Mode::Feeder) => {
+                                    "Force Feeder Present (override — only if you know you want it)"
+                                }
                             };
                             let before = choice;
                             egui::ComboBox::from_id_salt("mode_pick")
@@ -2699,7 +2746,7 @@ impl eframe::App for App {
                 if let Some(s) = &ok_status {
                     let mut caps: Vec<&str> = Vec::new();
                     if s.mode == game::Mode::Native {
-                        caps.push("Native DLSS (Feeder Optimize N/A)");
+                        caps.push("Native DLSS → Opti / RenoDX / Upstream (not Feeder)");
                     }
                     if s.rt_likely {
                         caps.push("RT-likely");
@@ -2708,7 +2755,7 @@ impl eframe::App for App {
                         caps.push("RE Engine");
                     }
                     if s.unreal_likely {
-                        caps.push("Unreal-likely");
+                        caps.push("Unreal-likely · tip: r.AntiAliasingMethod=0");
                     }
                     if s.unity_likely {
                         caps.push("Unity-likely");
@@ -2722,6 +2769,46 @@ impl eframe::App for App {
                                 .font(t::plex(11.5))
                                 .color(t::TEXT_MUTED),
                         );
+                    }
+                    if s.mode == game::Mode::Native
+                        && (game::mode_override() == Some(game::Mode::Feeder)
+                            || crate::game_overrides::find_override(&s.exe)
+                                .is_some_and(|o| o.prefer_native_engine == Some(true)
+                                    && game::mode_override() == Some(game::Mode::Feeder)))
+                    {
+                        ui.label(
+                            RichText::new(
+                                "Warning: Force Feeder on a native-DLSS game skips Opti/RenoDX. \
+                                 Prefer Auto or Force native unless you are testing Present-path Feeder.",
+                            )
+                            .font(t::plex(12.0))
+                            .color(t::DANGER),
+                        );
+                    }
+                    if s.mode == game::Mode::Native {
+                        if let Some(o) = crate::game_overrides::find_override(&s.exe) {
+                            if o.prefer_native_engine == Some(true)
+                                && game::mode_override() != Some(game::Mode::Feeder)
+                            {
+                                ui.label(
+                                    RichText::new(
+                                        "Native DLSS title: default to Opti / RenoDX / Upstream — \
+                                         do not Force Feeder unless you explicitly override.",
+                                    )
+                                    .font(t::plex(12.0))
+                                    .color(t::TEXT_SOFT),
+                                );
+                            }
+                        }
+                    }
+                    if let Some(o) = crate::game_overrides::find_override(&s.exe) {
+                        if let Some(tip) = o.setup_tip.as_ref().filter(|t| !t.is_empty()) {
+                            ui.label(
+                                RichText::new(tip.clone())
+                                    .font(t::plex(12.0))
+                                    .color(t::TEXT_SOFT),
+                            );
+                        }
                     }
                 }
                 if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
@@ -2738,7 +2825,11 @@ impl eframe::App for App {
 
                 // ── engine chooser ───────────────────────────────
                 let native = ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Native);
+                // Native discipline: never silently force Feeder. Non-native → ReShade/Feeder only.
                 if !native {
+                    self.engine = Engine::ReShade;
+                } else if self.engine != Engine::Opti && self.engine != Engine::ReShade {
+                    // Default native path: RenoDX / Upstream via ReShade (or Opti if already set).
                     self.engine = Engine::ReShade;
                 }
                 ui.horizontal(|ui| {
@@ -2750,9 +2841,9 @@ impl eframe::App for App {
                     );
                     ui.label(
                         RichText::new(if native {
-                            "— two ways to run DLSS 5 in this game, pick one"
+                            "— game has own DLSS: pick Opti, RenoDX, or Upstream — not Feeder"
                         } else {
-                            "— this game has no DLSS of its own, so only the ReShade path can work"
+                            "— no native DLSS: ReShade + Feeder Present path (early color optional, off by default)"
                         })
                         .font(t::plex(11.0))
                         .color(t::TEXT_DIM),
